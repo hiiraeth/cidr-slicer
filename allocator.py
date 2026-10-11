@@ -194,6 +194,56 @@ class _BuddyNode:
             ancestor.largest_free = ancestor._find_largest_free()
             ancestor = ancestor.parent
 
+    def _claim(self, target: ipaddress.IPv4Network) -> None:
+        """Recursively allocate exactly the target network.
+
+        Unlike _allocate(), which picks any free block of a given size, this
+        allocates one specific network. It follows a single path down: at
+        each level, it descends into the one child whose range contains the
+        target, splitting a FREE node first so that child exists. When it
+        reaches the node that matches the target exactly, a FREE node is
+        marked ALLOCATED and its largest_free drops to 0.
+
+        After the child returns, this node recomputes its own largest_free,
+        so every node on the path is correct once the recursion unwinds.
+
+        Arguments:
+            target: the network to allocate. Assumed to be inside this
+                node's network; BuddyAllocator.claim() validates that before
+                the recursion starts.
+
+        Raises:
+            ValueError: if the target is already allocated, contains an
+                allocation (its node is SPLIT), or is inside a larger block
+                that is already allocated.
+        """
+
+        if self.network == target:
+            if self.state == NodeState.FREE:
+                self.state = NodeState.ALLOCATED
+                self.largest_free = 0
+                return
+            if self.state == NodeState.SPLIT:
+                raise ValueError(f"{target} overlaps an allocation!")
+            if self.state == NodeState.ALLOCATED:
+                raise ValueError(f"{target} is already allocated!")
+
+        if self.state == NodeState.ALLOCATED:
+            raise ValueError(f"{target} is inside allocated {self.network}")
+        if self.state == NodeState.FREE:
+            self.split()
+
+        assert self.left is not None and self.right is not None
+
+        if target.subnet_of(self.left.network):
+            child = self.left
+        else:
+            child = self.right
+
+        child._claim(target=target)
+
+        self.largest_free = self._find_largest_free()
+
 class BuddyAllocator:
     """Allocates subnets from a master network using a buddy allocation tree.
 
@@ -202,8 +252,8 @@ class BuddyAllocator:
 
     Also keeps allocated_subnets, a set of every currently allocated network,
     so get_allocations() doesn't need to walk the tree. The set is a second
-    record alongside the tree's ALLOCATED nodes: allocate() and release()
-    keep the two in sync, and nothing else should change either one.
+    record alongside the tree's ALLOCATED nodes: allocate(), release() and
+    claim() keep the two in sync, and nothing else should change either one.
     """
 
     def __init__(self, root_cidr: str):
@@ -310,7 +360,7 @@ class BuddyAllocator:
         node = self._find_node(self.root, network)
 
         if node is None:
-            raise ValueError(f"could not find {network} in tree!")
+            raise ValueError(f"{network} cannot be released: not allocated!")
 
         if node.state != NodeState.ALLOCATED:
             raise ValueError(f"{network} cannot be released: not allocated!")
@@ -326,3 +376,31 @@ class BuddyAllocator:
         """
 
         return sorted(self.allocated_subnets)
+
+    def claim(self, network: ipaddress.IPv4Network) -> None:
+        """Allocate one exact network, such as one loaded from the database.
+
+        Used to rebuild the tree from saved allocations. Replaying
+        allocate(prefix_len) would not restore the same addresses, because
+        allocate() always takes the lowest free block of that size. Claiming
+        every saved network rebuilds a tree that holds the same allocations
+        and gives the same answers to later allocate() calls.
+
+        Arguments:
+            network: the network to allocate, i.e. 10.0.0.64/26. Must be
+                inside the master network.
+
+        Raises:
+            ValueError: if network is outside the master network.
+            ValueError: if network is already allocated, contains an
+                allocated block, or is inside an allocated block. A rejected
+                claim leaves allocated_subnets unchanged.
+        """
+
+        if not network.subnet_of(self.root.network):
+            raise ValueError(f"{network} is not in {self.root.network}!")
+        if network in self.allocated_subnets:
+            raise ValueError(f"{network} is already allocated")
+
+        self.root._claim(network)
+        self.allocated_subnets.add(network)
